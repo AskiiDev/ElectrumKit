@@ -16,6 +16,16 @@ fileprivate let newline: UInt8 = 0x0A
 /// - Important: This is always ASCII `0x20`.
 fileprivate let space: UInt8 = 0x20
 
+/// A set of valid JSON-RPC terminators
+///
+/// > Important: These are always:
+/// > - `}\n: (0x20, 0x0A)`
+/// > - `]\n: (0x5D, 0x0A)`
+fileprivate let terminators: Set<Data> = [
+    Data([0x7D, 0x0A]),
+    Data([0x5D, 0x0A])
+]
+
 /// Errors thrown by the Electrum client
 public enum ElectrumError: Error, Equatable {
     /// The network connection was closed before the request could complete
@@ -99,6 +109,8 @@ public final class ElectrumClient {
     // Buffers and timers
     private var sendTask: DispatchWorkItem? = nil
     private var sendLast: DispatchTime = .now()
+    
+    /// - Important: Must ONLY be modified on the write queue.
     private var sendBuffer: Data = Data()
     private var receiveBuffer: Data = Data()
     
@@ -257,10 +269,7 @@ public final class ElectrumClient {
             
             // Encode JSON payload
             let data = try? JSONEncoder().encode(request)
-            guard
-                var data = data,
-                !data.isEmpty
-            else {
+            guard var data = data, !data.isEmpty else {
                 self.log("Failed to encode { \"\(method)\", \(params) }")
                 completion(.failure(.requestNoncodable))
                 return
@@ -315,7 +324,7 @@ public final class ElectrumClient {
         }
     }
     
-    /// Removes a previously-registered subscription.
+    /// Removes a previously-registered subscription
     ///
     /// - Parameters:
     ///   - method: Subscription method name
@@ -336,7 +345,7 @@ public final class ElectrumClient {
     
     // MARK: - Packet handling
     
-    /// Enqueue an already-encoded packet for buffered sending.
+    /// Enqueue an already-encoded packet for buffered sending
     ///
     /// This appends to the send buffer and attempts to flush immediately. If the
     /// packet is too small (and force-send is not enabled), it will schedule a
@@ -365,43 +374,129 @@ public final class ElectrumClient {
             return false
         }
         
-        let payloadSize = sendBuffer.count
+        let largePayloadSize = sendBuffer.count
         
         // Only send if min packet size is exceeded,
         // or we have exceeded the buffer wait time
         // (or, packet sends are forced via config)
         guard
             config.packetForceSend ||
-            payloadSize >= config.packetMinSize ||
+            largePayloadSize >= config.packetMinSize ||
             timeSinceFlushSend() >= config.packetMinWait
         else {
             return false
         }
         
-        // Compute packet size as the next power of two greater
-        // than or equal to the send buffer size. Helps avoid
-        // some level of traffic analysis for < TLS 1.3
-        var packetSize = config.packetMinSize
-        while packetSize < payloadSize {
-            packetSize <<= 1
-            // In case of overflow
-            if packetSize <= 0 { return false }
-        }
+        // Ensure the last two bytes are in the terminators
+        // set - e.g., the buffer ends in '}\n' or ']\n'
+        guard terminators.contains(sendBuffer.suffix(2)) else { return false }
         
-        let padSize = packetSize - payloadSize
-        let halfSize = max(config.packetMinSize, packetSize / 2)
-       
-        // TODO: Actually flush the buffer, pad and send the packet
+        /*
+         * Same logic as Electrum's PaddedRSTransport, there
+         * are two options for flushing the send buffer:
+         *
+         * 1. Padding to the next power of two, creating a
+         *    "large" packet, flushes the full send buffer
+         *
+         * 2. OR, if the majority of the message would be,
+         *    padding, defer sending some messages and
+         *    create a packetwith half of that size
+         */
+        
+        // (1) Compute "large" size as the next power of two
+        // greater than the send buffer size. Helps avoid
+        // some level of traffic analysis for < TLS 1.3
+        var largePacketSize = config.packetMinSize
+        while largePacketSize <= largePayloadSize {
+            largePacketSize <<= 1
+            // In case of overflow
+            if largePacketSize <= 0 { return false }
+        }
+        let largePadSize = largePacketSize - largePayloadSize
+        
+        // (2) Compute "small" size as half the large packet size
+        let smallPacketSize = max(
+            config.packetMinSize,
+            largePacketSize / 2
+        )
+        var smallPayloadSize: Int?
+        
+        if let idx = sendBuffer.prefix(smallPacketSize).lastIndex(of: newline) {
+            // +1 to include newline
+            smallPayloadSize = idx + 1
+        }
+        let smallPadSize = smallPayloadSize.map { smallPacketSize - $0 } ?? Int.max
+        
+        let useLarge = (config.packetForceSend || largePadSize <= smallPadSize)
+        let (packetSize, packetPad): (Int, Int) = {
+            // (2) Flush some, defer for later
+            if !useLarge, let smallPayloadSize = smallPayloadSize {
+                return (smallPayloadSize, smallPadSize)
+            }
+            // (1) Flush all
+            return (largePayloadSize, largePadSize)
+        }()
+        
+        // Subdata will crash if we don't guard the range
+        guard
+            packetSize >= 2,
+            packetSize <= largePayloadSize,
+            packetPad >= 0
+        else { return false }
+        
+        let terminator = sendBuffer.subdata(in: (packetSize - 2)..<packetSize)
+        guard terminators.contains(terminator) else { return false }
+        
+        let prefix = sendBuffer.subdata(in: 0..<(packetSize - 2))
+        let padding = Data(
+            repeating: space,
+            count: max(0, packetPad)
+        )
+        
+        // Build the final packet
+        var out = Data()
+        out.reserveCapacity(
+            prefix.count +
+            padding.count +
+            terminator.count
+        )
+        out.append(prefix)
+        out.append(padding)
+        out.append(terminator)
+        
+        print(sendBuffer.count)
+        print(out.count)
+        
+        // Send and update buffer in completion
+        // handler (back on the write queue)
+        connection?.send(
+            content: out,
+            completion: .contentProcessed({ [weak self] error in
+                if let error = error {
+                    self?.log("Send error: \(error)")
+                }
+            })
+        )
+        
+        sendLast = DispatchTime.now()
+        if packetSize <= sendBuffer.count {
+            sendBuffer.removeSubrange(0..<packetSize)
+            scheduleFlushSend()
+        } else {
+            sendBuffer.removeAll()
+            cancelFlushSend()
+        }
         
         return true
     }
-    
+   
     /// Schedule a future attempt to call `flushSend()`
     ///
     /// This function creates a `sendTask` to fire after the configured `packetMinWait`
     /// to ensure small payloads are not indefinitely buffered.
     private func scheduleFlushSend() {
-        guard sendTask == nil else { return }
+        guard sendTask == nil
+        else { return }
         
         let remaining = max(0.0, config.packetMinWait - timeSinceFlushSend())
         
@@ -541,8 +636,7 @@ public final class ElectrumClient {
         main.async(flags: .barrier) { [weak self] in
             guard let self = self else { return }
 
-            guard
-                let context = self.requests.removeValue(forKey: id)
+            guard let context = self.requests.removeValue(forKey: id)
             else { return }
 
             context.timer?.cancel()
