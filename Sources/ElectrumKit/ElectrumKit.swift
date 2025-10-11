@@ -464,9 +464,6 @@ public final class ElectrumClient {
         out.append(padding)
         out.append(terminator)
         
-        print(sendBuffer.count)
-        print(out.count)
-        
         // Send and update buffer in completion
         // handler (back on the write queue)
         connection?.send(
