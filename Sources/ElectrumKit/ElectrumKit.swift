@@ -36,6 +36,10 @@ public enum ElectrumError: Error, Equatable {
     case requestLimit
     /// The request could not be encoded
     case requestNoncodable
+    /// The response was invalid, with no decodable error
+    case responseInvalid
+    /// The response had a JSON-RPC error
+    case responseError(code: Int, message: String)
     /// An unknown error occurred
     case unknown
 }
@@ -78,20 +82,97 @@ public struct ElectrumConfig {
     }
 }
 
+/// A type-erased wrapper for encoding and decoding values
+///
+/// Supported types:
+/// - Primitives: `Int`, `Double`, `String`, `Bool`
+/// - Collections: `Array`, `Dictionary`
+/// - Null values: `NSNull`
+struct AnyCodable: Codable {
+    let value: Any
+    
+    init(_ value: Any) {
+        self.value = value
+    }
+    
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let int = try? container.decode(Int.self) {
+            value = int
+        } else if let double = try? container.decode(Double.self) {
+            value = double
+        } else if let string = try? container.decode(String.self) {
+            value = string
+        } else if let bool = try? container.decode(Bool.self) {
+            value = bool
+        } else if let array = try? container.decode([AnyCodable].self) {
+            value = array.map { $0.value }
+        } else if let dict = try? container.decode([String: AnyCodable].self) {
+            value = dict.mapValues { $0.value }
+        } else if container.decodeNil() {
+            value = NSNull()
+        } else {
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Could not decode value"
+            )
+        }
+    }
+    
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch value {
+        case let int as Int:
+            try container.encode(int)
+        case let double as Double:
+            try container.encode(double)
+        case let string as String:
+            try container.encode(string)
+        case let bool as Bool:
+            try container.encode(bool)
+        case let array as [Any]:
+            try container.encode(array.map { AnyCodable($0) })
+        case let dict as [String: Any]:
+            try container.encode(dict.mapValues { AnyCodable($0) })
+        case is NSNull:
+            try container.encodeNil()
+        default:
+            throw EncodingError.invalidValue(value, EncodingError.Context(
+                codingPath: encoder.codingPath,
+                debugDescription: "Cannot encode value of type \(type(of: value))"
+            ))
+        }
+    }
+}
+
 /// An encodable JSON-RPC request
 struct RPCRequest: Encodable {
     let method: String
-    let params: [String]
+    let params: AnyCodable
     let id: Int
 
-    init(method: String, params: [String], id: Int) {
+    init(method: String, params: [Any], id: Int) {
         self.method = method
-        self.params = params
+        self.params = AnyCodable(params)
         self.id = id
     }
 }
 
-/// Lightweight Electrum client.
+/// An encodable JSON-RPC response
+struct RPCResponse: Codable {
+    let result: AnyCodable?
+    let error: RPCError?
+    let id: Int?
+}
+
+/// An encodable JSON-RPC error
+struct RPCError: Codable {
+    let code: Int
+    let message: String
+    let data: AnyCodable?
+}
+
+/// Lightweight Electrum client
 ///
 /// This class manages a single `NWConnection` to an Electrum-compatible server,
 /// supports simple request/response interactions and persistent subscriptions.
@@ -110,11 +191,12 @@ public final class ElectrumClient {
     private var sendTask: DispatchWorkItem? = nil
     private var sendLast: DispatchTime = .now()
     
-    /// - Important: Must ONLY be modified on the write queue.
     private var sendBuffer: Data = Data()
+    /// - Important: Must ONLY be modified on the read queue.
     private var receiveBuffer: Data = Data()
     
     // Request management
+    
     private var requestId: Int = 1
     private var requests: [Int: NetworkRequest] = [:]
     private var subscriptions: [String: NetworkSubscription] = [:]
@@ -129,20 +211,20 @@ public final class ElectrumClient {
     private var retries: Int = 0
     
     // Internal queues
-    private let main: DispatchQueue
-    private let write: DispatchQueue
-    private let verify: DispatchQueue
+    private let network: DispatchQueue
+    private let read: DispatchQueue
+    private let callback: DispatchQueue
     
     // MARK: - Internal helper types
     
     private struct NetworkSubscription {
         /// Handler invoked with the received data payloads for the subscription
-        let handler: ([String]) -> Void
+        let handler: ([Any]) -> Void
     }
     
     private struct NetworkRequest {
         /// Completion used to return result to the caller
-        let completion: (Result<String, ElectrumError>) -> Void
+        let completion: (Result<Any, ElectrumError>) -> Void
         /// Optional timer that triggers request timeout handling
         let timer: DispatchSourceTimer?
     }
@@ -156,16 +238,9 @@ public final class ElectrumClient {
         self.port = port
         self.config = config
         
-        main = DispatchQueue(
-            label: "\(host).main",
-            attributes: .concurrent
-        )
-        write = DispatchQueue(
-            label: "\(host).write"
-        )
-        verify = DispatchQueue(
-            label: "\(host).tls"
-        )
+        network = DispatchQueue(label: "\(host).main")
+        read = DispatchQueue(label: "\(host).read")
+        callback = DispatchQueue(label: "\(host).callback")
         
         // Base queries used for saving certificates + markers to the keychain
         caKeychainQuery = [
@@ -191,7 +266,7 @@ public final class ElectrumClient {
     /// This function is safe to call from any queue; it dispatches internal work
     /// onto the client's `main` queue.
     public func start() {
-        main.async(flags: .barrier) { [weak self] in
+        network.async { [weak self] in
             self?.connect()
         }
     }
@@ -201,7 +276,7 @@ public final class ElectrumClient {
     /// Cancelling the connection will also clear outstanding requests and
     /// subscriptions
     public func stop() {
-        main.async(flags: .barrier) { [weak self] in
+        network.async { [weak self] in
             self?.disconnect()
         }
     }
@@ -215,24 +290,28 @@ public final class ElectrumClient {
     ///   - completion: Completion invoked with the result or an `ElectrumError`
     public func request(
         method: String,
-        params: [String] = [],
+        params: [Any] = [],
         timeout: TimeInterval? = nil,
-        completion: @escaping (Result<String, ElectrumError>) -> Void
+        completion: @escaping (Result<Any, ElectrumError>) -> Void
     ) {
-        main.async(flags: .barrier) { [weak self] in
+        network.async { [weak self] in
             guard let self = self else { return }
 
             // Ensure connection is open
             guard self.connected else {
                 self.log("Request \"\(method)\" failed: connection closed")
-                completion(.failure(.connectionClosed))
+                self.callback.async {
+                    completion(.failure(.connectionClosed))
+                }
                 return
             }
             
             // Enforce request concurrency limit
             guard self.requests.count < config.requestLimit else {
                 self.log("Request \"\(method)\" failed: request limit reached")
-                completion(.failure(.requestLimit))
+                self.callback.async {
+                    completion(.failure(.requestLimit))
+                }
                 return
             }
             
@@ -242,7 +321,7 @@ public final class ElectrumClient {
             var timer: DispatchSourceTimer? = nil
             if let timeout = timeout {
                 // Start the countdown for the request timeout
-                let source = DispatchSource.makeTimerSource(queue: self.main)
+                let source = DispatchSource.makeTimerSource(queue: self.network)
                 source.schedule(deadline: .now() + timeout)
                 source.setEventHandler { [weak self] in
                     self?.handleRequestTimeout(currentId)
@@ -251,13 +330,6 @@ public final class ElectrumClient {
                 source.resume()
                 timer = source
             }
-
-            // Store the request context so responses
-            // and their timeouts can be correlated
-            self.requests[currentId] = NetworkRequest(
-                completion: completion,
-                timer: timer
-            )
             
             let request = RPCRequest(
                 method: method,
@@ -271,9 +343,18 @@ public final class ElectrumClient {
             let data = try? JSONEncoder().encode(request)
             guard var data = data, !data.isEmpty else {
                 self.log("Failed to encode { \"\(method)\", \(params) }")
-                completion(.failure(.requestNoncodable))
+                self.callback.async {
+                    completion(.failure(.requestNoncodable))
+                }
                 return
             }
+            
+            // Store the request context so responses
+            // and their timeouts can be correlated
+            self.requests[currentId] = NetworkRequest(
+                completion: completion,
+                timer: timer
+            )
             
             // Each RPC call MUST be terminated by
             // a single newline to delimit messages
@@ -292,15 +373,15 @@ public final class ElectrumClient {
     /// Subscriptions are stored locally and will be re-requested on reconnect.
     public func subscribe(
         method: String,
-        params: [String] = [],
-        handler: @escaping ([String]) -> Void
+        params: [Any] = [],
+        handler: @escaping ([Any]) -> Void
     ) {
         let key = self.key(
             method: method,
             params: params
         )
         
-        main.async(flags: .barrier) { [weak self] in
+        network.async { [weak self] in
             guard let self = self else { return }
 
             // Subscriptions can be keyed in without an active connection
@@ -316,7 +397,7 @@ public final class ElectrumClient {
             ) { result in
                 switch result {
                 case .success(let data):
-                    handler([data])
+                    handler(params + [data])
                 case .failure:
                     break
                 }
@@ -331,14 +412,14 @@ public final class ElectrumClient {
     ///   - params: Array of string parameters used
     public func unsubscribe(
         method: String,
-        params: [String] = []
+        params: [Any] = []
     ) {
         let key = self.key(
             method: method,
             params: params
         )
         
-        main.async(flags: .barrier) { [weak self] in
+        network.async { [weak self] in
             self?.subscriptions.removeValue(forKey: key)
         }
     }
@@ -351,7 +432,7 @@ public final class ElectrumClient {
     /// packet is too small (and force-send is not enabled), it will schedule a
     /// delayed flush instead.
     private func enqueuePacket(_ packet: Data) {
-        write.async { [weak self] in
+        network.async { [weak self] in
             guard let self = self else { return }
             
             self.sendBuffer.append(packet)
@@ -504,7 +585,7 @@ public final class ElectrumClient {
         }
         
         sendTask = task
-        write.asyncAfter(
+        network.asyncAfter(
             deadline: .now() + remaining,
             execute: task
         )
@@ -531,9 +612,9 @@ public final class ElectrumClient {
     /// purely as a short, deterministic identifier, not for cryptographic purposes.
     private func key(
         method: String,
-        params: [String] = []
+        params: [Any] = []
     ) -> String {
-        let serialised = method + params.joined()
+        let serialised = params.map { String(describing: $0) }.joined(separator: ",")
         guard let data = serialised.data(using: .utf8) else {
             // Shouldn't ever happen
             return serialised
@@ -575,7 +656,7 @@ public final class ElectrumClient {
                     callback: callback
                 )
             },
-            verify
+            network
         )
         
         let parameters = NWParameters(tls: options)
@@ -588,7 +669,7 @@ public final class ElectrumClient {
         connection?.stateUpdateHandler = { [weak self] state in
             self?.handleStateUpdate(state)
         }
-        connection?.start(queue: main)
+        connection?.start(queue: network)
         
         log("Connection initiated")
     }
@@ -597,7 +678,18 @@ public final class ElectrumClient {
     private func disconnect() {
         connection?.cancel()
         connection = nil
+        
+        sendTask?.cancel()
+        sendTask = nil
+
         connected = false
+        
+        for (_, request) in requests {
+            request.timer?.cancel()
+            callback.async {
+                request.completion(.failure(.connectionClosed))
+            }
+        }
         
         requests.removeAll()
         subscriptions.removeAll()
@@ -605,16 +697,53 @@ public final class ElectrumClient {
         log("Connection closed")
     }
     
-    // MARK: - Network Handlers
+    /// Initiates continuous receiving of data from the server
+    ///
+    /// Recursively calls itself to maintain an ongoing receive
+    /// loop. Data is read in chunks (up to 65536 bytes).
+    private func startReceiving() {
+        connection?.receive(
+            minimumIncompleteLength: 1,
+            maximumLength: 65536,
+            completion: { [weak self] data, _, isComplete, error in
+                guard let self = self else { return }
+                
+                if let error = error {
+                    self.log("Receive error: \(error)")
+                }
+                
+                if let data = data, !data.isEmpty {
+                    self.handleReceivedData(data)
+                }
+                
+                if !isComplete {
+                    self.startReceiving()
+                }
+            }
+        )
+    }
+    
+    private func startPinging() {
+        
+    }
+    
+    private func resubscribeAll() {
+        
+    }
     
     // TODO: Handles updates to the connection state.
     private func handleStateUpdate(_ state: NWConnection.State) {
         switch state {
         case .ready:
-            log("Connection ready")
             connected = true
             retries = 0
+
+            startReceiving()
+            startPinging()
+            resubscribeAll()
             
+            log("Connection ready")
+
         case .failed(let error):
             log("Connection broken: \(error)")
             connected = false
@@ -630,14 +759,69 @@ public final class ElectrumClient {
     
     /// Handles a request timeout firing for a previously-sent request
     private func handleRequestTimeout(_ id: Int) {
-        main.async(flags: .barrier) { [weak self] in
+        guard let request = self.requests.removeValue(forKey: id)
+        else { return }
+
+        request.timer?.cancel()
+        self.callback.async {
+            request.completion(.failure(.requestTimeout))
+        }
+    }
+    
+    /// Appends newly-received raw bytes to the receive buffer and extracts
+    /// newline-terminated messages for processing
+    ///
+    /// Data slicing and decoding is performed on the `read` queue
+    private func handleReceivedData(_ data: Data) {
+        read.async { [weak self] in
             guard let self = self else { return }
-
-            guard let context = self.requests.removeValue(forKey: id)
-            else { return }
-
-            context.timer?.cancel()
-            context.completion(.failure(.requestTimeout))
+            
+            self.receiveBuffer.append(data)
+            
+            while let range = self.receiveBuffer.range(of: Data([newline])) {
+                let data = self.receiveBuffer.subdata(in: 0..<range.lowerBound)
+                self.receiveBuffer.removeSubrange(0...range.lowerBound)
+                
+                if !data.isEmpty {
+                    self.processResponse(data)
+                }
+            }
+        }
+    }
+    
+    /// Decodes a single JSON-RPC response and dispatches the result to the
+    /// original request's completion handler (if the `id` matches)
+    private func processResponse(_ data: Data) {
+        guard
+            let response = try? JSONDecoder().decode(RPCResponse.self, from: data),
+            let id = response.id
+        else {
+            log("Failed to decode message: \(String(data: data, encoding: .utf8) ?? "invalid")")
+            return
+        }
+        
+        network.async { [weak self] in
+            guard
+                let self = self,
+                let request = self.requests.removeValue(forKey: id)
+            else {
+                return
+            }
+            
+            request.timer?.cancel()
+            
+            callback.async {
+                if let error = response.error {
+                    request.completion(.failure(.responseError(
+                        code: error.code,
+                        message: error.message
+                    )))
+                } else if let result = response.result {
+                    request.completion(.success(result.value))
+                } else {
+                    request.completion(.failure(.responseInvalid))
+                }
+            }
         }
     }
     
