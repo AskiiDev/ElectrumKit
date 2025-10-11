@@ -6,7 +6,7 @@ import Network
 import os.log
 #endif
 
-/// A single ASCII newline byte (`\n`) used to terrminate packets
+/// A single ASCII newline byte (`\n`) used to terminate packets
 ///
 /// - Important: This is always ASCII `0x0A`.
 fileprivate let newline: UInt8 = 0x0A
@@ -24,6 +24,8 @@ public enum ElectrumError: Error, Equatable {
     case requestTimeout
     /// The client has reached its configured concurrent request limit
     case requestLimit
+    /// The request could not be encoded
+    case requestNoncodable
     /// An unknown error occurred
     case unknown
 }
@@ -260,6 +262,7 @@ public final class ElectrumClient {
                 !data.isEmpty
             else {
                 self.log("Failed to encode { \"\(method)\", \(params) }")
+                completion(.failure(.requestNoncodable))
                 return
             }
             
