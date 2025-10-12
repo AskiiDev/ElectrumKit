@@ -751,17 +751,17 @@ public final class ElectrumClient {
         // Ensure the last two bytes are in the terminators
         // set - e.g., the buffer ends in '}\n' or ']\n'
         guard terminators.contains(sendBuffer.suffix(2)) else { return false }
-        
-        /*
+    
+        /* 
          * Same logic as Electrum's PaddedRSTransport, there
          * are two options for flushing the send buffer:
          *
          * 1. Padding to the next power of two, creating a
          *    "large" packet, flushes the full send buffer
          *
-         * 2. OR, if the majority of the message would be,
+         * 2. OR, if the majority of the message would be
          *    padding, defer sending some messages and
-         *    create a packetwith half of that size
+         *    create a packet of half the "large" size
          */
         
         // (1) Compute "large" size as the next power of two
