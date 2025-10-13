@@ -654,7 +654,7 @@ public final class ElectrumClient {
                 params: params,
                 handler: handler
             )
-            guard connection != nil, self.status == .connected else { return }
+            guard self.connection != nil, self.status == .connected else { return }
             
             self.request(
                 method: method,
