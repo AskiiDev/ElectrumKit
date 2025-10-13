@@ -751,8 +751,8 @@ public final class ElectrumClient {
         // Ensure the last two bytes are in the terminators
         // set - e.g., the buffer ends in '}\n' or ']\n'
         guard terminators.contains(sendBuffer.suffix(2)) else { return false }
-    
-        /* 
+        
+        /*
          * Same logic as Electrum's PaddedRSTransport, there
          * are two options for flushing the send buffer:
          *
@@ -1322,13 +1322,16 @@ public final class ElectrumClient {
         trust: sec_trust_t,
         callback: @escaping (Bool) -> Void
     ) {
-        // Convert sec_trust_t to SecTrustRef for higher-level APIs
+        // Convert sec_trust_t to a SecTrust reference for higher-level APIs
         let ref = sec_trust_copy_ref(trust).takeRetainedValue()
         let trusted = SecTrustEvaluateWithError(ref, nil)
+        
+        log("Trusted by system CA: \(trusted)")
         
         // Subsequent connection, we check if
         // host has been marked as CA trusted
         if loadCaTrustMarker() {
+            log("Found trust marker, accepting: \(trusted)")
             callback(trusted)
             return
         }
@@ -1337,6 +1340,7 @@ public final class ElectrumClient {
             let chain = SecTrustCopyCertificateChain(ref) as? [SecCertificate],
             let certificate = chain.first
         else {
+            log("Could not retrieve leaf cert, accepting: false")
             callback(false)
             return
         }
@@ -1344,25 +1348,21 @@ public final class ElectrumClient {
         // Subsequent connection, we check if
         // host has been marked as self signed
         if let pinned = loadPinnedCertificate() {
-            SecTrustSetAnchorCertificates(ref, [pinned] as CFArray)
-            SecTrustSetAnchorCertificatesOnly(ref, true)
-            
-            // We explicitly do not want to check
-            // hostnames for self signed certs
-            let policy = SecPolicyCreateSSL(true, nil)
-            SecTrustSetPolicies(ref, [policy] as CFArray)
-            
             let serverData = SecCertificateCopyData(certificate) as Data
             let pinnedData = SecCertificateCopyData(pinned) as Data
             
             if serverData != pinnedData {
+                log("Self-signed certificate mismatch!")
                 callback(false)
                 return
             }
             
-            if SecTrustEvaluateWithError(ref, nil) {
+            log("Self-signed matches pinned certificate")
+            
+            if (validateCertificate(certificate: pinned, trust: ref)) {
                 callback(true)
             } else {
+                log("Deleting expired or non-compliant self-signed certificate")
                 deleteCertificateAndTrustMarker()
                 callback(false)
             }
@@ -1372,10 +1372,48 @@ public final class ElectrumClient {
         
         // First Use (TOFU): No certificate or CA trust marker found
         if trusted {
+            log("System CA trusted, saving trust marker")
             callback(saveCaTrustMarker())
-        } else {
+        } else if (validateCertificate(certificate: certificate, trust: ref)) {
+            log("Self-signed, saving pinned certificate")
             callback(savePinnedCertificate(certificate))
+        } else {
+            log("Something went wrong. Keychain access broken?")
+            callback(false)
         }
+    }
+    
+    /// Validate a certificate by treating it as an explicit trust anchor
+    ///
+    /// This function configures and evaluates the supplied `SecTrust` object so that
+    /// the supplied `certificate` is the *only* trust anchor.
+    ///
+    /// - Important: This function **mutates** the provided `trust` object: it sets the
+    /// anchor certificates, forces anchor-only evaluation, and replaces the policies.
+    private func validateCertificate(
+        certificate: SecCertificate,
+        trust: SecTrust
+    ) -> Bool {
+        SecTrustSetAnchorCertificates(trust, [certificate] as CFArray)
+        SecTrustSetAnchorCertificatesOnly(trust, true)
+        
+        // We explicitly do not want to check hostnames, maximum temporal validity
+        // (certificates being valid for too long), or EKU for self signed certs
+        let policy = SecPolicyCreateBasicX509()
+        SecTrustSetPolicies(trust, [policy] as CFArray)
+        
+        var error: CFError?
+        if SecTrustEvaluateWithError(trust, &error) {
+            log("Self-signed certificate valid")
+            return true
+        }
+        
+        if let error = error {
+            log("TLS verification error: \(error)")
+        }
+        
+        log("Self-signed certificate invalid")
+        return false
     }
     
     // MARK: - Certificate Keychain Storage
