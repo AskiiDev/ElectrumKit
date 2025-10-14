@@ -311,7 +311,7 @@ struct RPCResponse: Decodable {
 }
 
 /// A decodeable JSON-RPC 2.0 Notification
-struct RPCNotificaton: Decodable {
+struct RPCNotification: Decodable {
     
     /// The JSON-RPC protocol version identifier
     let jsonrpc: String?
@@ -1229,7 +1229,7 @@ public final class ElectrumClient {
             handleResponse(id: id, response: response)
             return
         } else if
-            let notification = try? JSONDecoder().decode(RPCNotificaton.self, from: data)
+            let notification = try? JSONDecoder().decode(RPCNotification.self, from: data)
         {
             handleNotification(notification)
             return
@@ -1276,7 +1276,7 @@ public final class ElectrumClient {
     /// - Parameter notification: The decoded notification object
     ///
     /// - Note: Notifications with invalid parameters or no matching subscription are ignored.
-    private func handleNotification(_ notification: RPCNotificaton) {
+    private func handleNotification(_ notification: RPCNotification) {
         guard let data = notification.params.value as? [Any], !data.isEmpty else {
             log("Invalid notification: \(notification)")
             return
