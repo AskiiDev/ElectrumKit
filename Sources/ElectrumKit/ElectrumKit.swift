@@ -121,6 +121,10 @@ public struct ElectrumConfig {
     /// (as a fraction of the delay) is added to each reconnection delay to prevent
     ///  thundering herd problems.
     public let reconnectJitter: Double
+    
+    /// Queue for invoking completion handlers
+    public let callbackQueue: DispatchQueue
+    
    
     /// Creates a new Electrum client configuration.
     ///
@@ -136,6 +140,7 @@ public struct ElectrumConfig {
     ///   - reconnectMaxDelay: The maximum reconnection delay. Defaults to `60.0` seconds
     ///   - reconnectMultiplier: The exponential backoff multiplier. Defaults to `2.0`
     ///   - reconnectJitter: The jitter factor. Defaults to `0.1`
+    ///   - callbackQueue: The user callback queue. Defaults to `.main`
     public init(
         pingInterval: TimeInterval = 30.0,
         requestLimit: Int = 100,
@@ -147,7 +152,8 @@ public struct ElectrumConfig {
         reconnectDelay: TimeInterval = 1.0,
         reconnectMaxDelay: TimeInterval = 60.0,
         reconnectMultiplier: Double = 2.0,
-        reconnectJitter: Double = 0.1
+        reconnectJitter: Double = 0.1,
+        callbackQueue: DispatchQueue = .main
     ) {
         self.pingInterval = pingInterval
         self.requestLimit = requestLimit
@@ -163,6 +169,8 @@ public struct ElectrumConfig {
         self.reconnectMaxDelay = reconnectMaxDelay
         self.reconnectMultiplier = reconnectMultiplier
         self.reconnectJitter = reconnectJitter
+        
+        self.callbackQueue = callbackQueue
     }
 }
 
@@ -426,10 +434,7 @@ public final class ElectrumClient {
     
     /// Queue for processing received data
     private let read: DispatchQueue
-    
-    /// Queue for invoking completion handlers
-    private let callback: DispatchQueue
-    
+
     // MARK: - Internal helper types
     
     /// The connection status of the client
@@ -488,7 +493,6 @@ public final class ElectrumClient {
         
         network = DispatchQueue(label: "\(host).network")
         read = DispatchQueue(label: "\(host).read")
-        callback = DispatchQueue(label: "\(host).callback")
         
         // Base queries used for saving certificates + markers to the keychain
         caKeychainQuery = [
@@ -560,7 +564,7 @@ public final class ElectrumClient {
             // Ensure connection is open
             guard connection != nil else {
                 self.log("Request \"\(method)\" failed: connection closed")
-                self.callback.async {
+                self.config.callbackQueue.async {
                     completion(.failure(.connectionClosed))
                 }
                 return
@@ -569,7 +573,7 @@ public final class ElectrumClient {
             // Enforce request concurrency limit
             guard self.requests.count < config.requestLimit else {
                 self.log("Request \"\(method)\" failed: request limit reached")
-                self.callback.async {
+                self.config.callbackQueue.async {
                     completion(.failure(.requestLimit))
                 }
                 return
@@ -603,7 +607,7 @@ public final class ElectrumClient {
             let data = try? JSONEncoder().encode(request)
             guard var data = data, !data.isEmpty else {
                 self.log("Failed to encode { \"\(method)\", \(params) }")
-                self.callback.async {
+                self.config.callbackQueue.async {
                     completion(.failure(.requestNoncodable))
                 }
                 return
@@ -663,10 +667,10 @@ public final class ElectrumClient {
                 guard let self = self else { return }
                 switch result {
                 case .success(let data):
-                    self.log("Subscribed to (\(method), \(params))")
+                    self.log("Subscribed to { \"\(method)\", \(params) }")
                     handler(params + [data])
                 case .failure(let error):
-                    self.log("Subscription to (\(method), \(params)) failed: \(error)")
+                    self.log("Subscription to { \"\(method)\", \(params) } failed: \(error)")
                 }
             }
         }
@@ -685,6 +689,8 @@ public final class ElectrumClient {
             method: method,
             params: params
         )
+        
+        log("Unsubscribed from { \"\(method)\", \(params) }")
         
         network.async { [weak self] in
             self?.subscriptions.removeValue(forKey: key)
@@ -1004,7 +1010,7 @@ public final class ElectrumClient {
         // Fail all outstanding requests
         for (_, request) in requests {
             request.timer?.cancel()
-            callback.async {
+            config.callbackQueue.async {
                 request.completion(.failure(.connectionClosed))
             }
         }
@@ -1074,9 +1080,9 @@ public final class ElectrumClient {
                 switch result {
                 case .success(let data):
                     subscription.handler(subscription.params + [data])
-                    self.log("Resubscribed to (\(subscription.method), \(subscription.params))")
+                    self.log("Resubscribed to { \"\(subscription.method)\", \(subscription.params) }")
                 case .failure(let error):
-                    self.log("Resubscription to (\(subscription.method), \(subscription.params)) failed: \(error)")
+                    self.log("Resubscription to { \"\(subscription.method)\", \(subscription.params) } failed: \(error)")
                     break
                 }
             }
@@ -1184,7 +1190,7 @@ public final class ElectrumClient {
         else { return }
 
         request.timer?.cancel()
-        self.callback.async {
+        self.config.callbackQueue.async {
             request.completion(.failure(.requestTimeout))
         }
     }
@@ -1256,7 +1262,7 @@ public final class ElectrumClient {
             
             request.timer?.cancel()
             
-            callback.async {
+            config.callbackQueue.async {
                 if let error = response.error {
                     request.completion(.failure(.responseError(
                         code: error.code,
@@ -1293,7 +1299,7 @@ public final class ElectrumClient {
                 return
             }
             
-            callback.async {
+            config.callbackQueue.async {
                 subscription.handler(data)
             }
         }

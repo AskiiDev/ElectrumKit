@@ -7,7 +7,6 @@
 - **TLS security:** Supports Trust-On-First-Use (TOFU) certificate pinning and system CA verification
 - **Privacy:** Packet buffering and padding to help mitigate traffic analysis for < `TLS 1.3`
 - **Reliability:** Automatic reconnection with exponential backoff and jitter
-- **Thread safety:** All public API functions are safe to call from any dispatch queue
 
 ## Requirements
 - iOS 15.0+ / macOS 12.0+
@@ -53,17 +52,6 @@ client.subscribe(
     params: []
 ) { notification in
     print("Received notification: \(notification)")
-}
-```
-
-## Thread safety
-All public methods are thread-safe. Completion handlers are invoked on an internal serial queue.<br>
-Importantly, for UI updates, make sure you *explicitly* dispatch to the main queue:
-```swift
-client.request(method: "server.ping") { result in
-    DispatchQueue.main.async {
-        // Update UI
-    }
 }
 ```
 
