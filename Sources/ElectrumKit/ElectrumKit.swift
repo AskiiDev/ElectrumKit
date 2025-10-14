@@ -1103,7 +1103,7 @@ public final class ElectrumClient {
         )
         
         let jitter = baseDelay * config.reconnectJitter * Double.random(in: -1...1)
-        let delay = max(baseDelay, baseDelay + jitter)
+        let delay = max(0.0, baseDelay + jitter)
         
         log("Scheduling reconnect in \(delay) seconds (attempt \(reconnectAttempts))")
         reconnectAttempts += 1
