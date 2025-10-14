@@ -548,10 +548,6 @@ public final class ElectrumClient {
     ///   - timeout: An optional timeout interval in seconds. If the response is not received
     ///              within this interval, completion is called with ``ElectrumError/requestTimeout``
     ///   - completion: A completion handler called with the result of the request
-    ///
-    /// The completion handler is always invoked on an internal serial queue. If you need
-    /// to update UI or perform other main-thread work, dispatch to the main queue explicitly.
-    ///
     public func request(
         method: String,
         params: [Any] = [],
