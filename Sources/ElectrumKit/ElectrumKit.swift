@@ -369,7 +369,10 @@ public final class ElectrumClient {
     
     #if DEBUG
     /// Logger is only used in DEBUG builds
-    private let logger: Logger = Logger(subsystem: "electrum", category: "client")
+    private let logger: Logger = Logger(
+        subsystem: "electrum",
+        category: "client"
+    )
     #endif
 
     /// The remote hostname to connect to
@@ -1264,10 +1267,9 @@ public final class ElectrumClient {
                         code: error.code,
                         message: error.message
                     )))
-                } else if let result = response.result {
-                    request.completion(.success(result.value))
                 } else {
-                    request.completion(.failure(.responseInvalid))
+                    let value = response.result?.value ?? NSNull()
+                    request.completion(.success(value))
                 }
             }
         }
