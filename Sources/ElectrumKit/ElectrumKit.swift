@@ -71,6 +71,13 @@ public struct ElectrumConfig {
     ///
     /// When this limit is reached, new requests will fail with ``ElectrumError/requestLimit``.
     public let requestLimit: Int
+
+    /// The default timeout interval in seconds applied to requests that do not
+    /// specify their own
+    ///
+    /// Guarantees every request's completion handler is eventually invoked, even
+    /// when the connection silently dies without a state transition.
+    public let requestTimeout: TimeInterval
     
     /// The minimum packet size in bytes before flushing the send buffer
     ///
@@ -131,6 +138,7 @@ public struct ElectrumConfig {
     /// - Parameters:
     ///   - pingInterval: The interval between ping messages. Defaults to `30.0` seconds
     ///   - requestLimit: The maximum number of concurrent requests. Defaults to `100`
+    ///   - requestTimeout: The default request timeout. Defaults to `30.0` seconds
     ///   - packetMinSize: The minimum packet size in bytes. Defaults to `1024`
     ///   - packetForceSend: Whether to force immediate sends. Defaults to `false`
     ///   - packetMinWait: The minimum wait time before flushing. Defaults to `1.0` second
@@ -144,6 +152,7 @@ public struct ElectrumConfig {
     public init(
         pingInterval: TimeInterval = 30.0,
         requestLimit: Int = 100,
+        requestTimeout: TimeInterval = 30.0,
         packetMinSize: Int = 1024,
         packetForceSend: Bool = false,
         packetMinWait: TimeInterval = 1.0,
@@ -157,6 +166,7 @@ public struct ElectrumConfig {
     ) {
         self.pingInterval = pingInterval
         self.requestLimit = requestLimit
+        self.requestTimeout = requestTimeout
         
         self.packetMinSize = packetMinSize
         self.packetMinWait = packetMinWait
@@ -425,6 +435,9 @@ public final class ElectrumClient {
     
     /// The number of reconnection attempts made
     private var reconnectAttempts: Int = 0
+
+    /// The number of consecutive keepalive ping failures
+    private var pingFailures: Int = 0
     
     /// A scheduled task to attempt reconnection
     private var reconnectTask: DispatchWorkItem? = nil
@@ -549,7 +562,8 @@ public final class ElectrumClient {
     ///   - method: The remote method name to invoke
     ///   - params: An array of parameters to pass to the method. Defaults to an empty array
     ///   - timeout: An optional timeout interval in seconds. If the response is not received
-    ///              within this interval, completion is called with ``ElectrumError/requestTimeout``
+    ///              within this interval, completion is called with ``ElectrumError/requestTimeout``.
+    ///              When `nil`, ``ElectrumConfig/requestTimeout`` applies
     ///   - completion: A completion handler called with the result of the request
     public func request(
         method: String,
@@ -581,18 +595,16 @@ public final class ElectrumClient {
             let currentId = self.requestId
             self.requestId += 1
         
-            var timer: DispatchSourceTimer? = nil
-            if let timeout = timeout {
-                // Start the countdown for the request timeout
-                let source = DispatchSource.makeTimerSource(queue: self.network)
-                source.schedule(deadline: .now() + timeout)
-                source.setEventHandler { [weak self] in
-                    self?.handleRequestTimeout(currentId)
-                }
-                
-                source.resume()
-                timer = source
+            // Start the countdown for the request timeout
+            let resolvedTimeout = timeout ?? config.requestTimeout
+            let source = DispatchSource.makeTimerSource(queue: self.network)
+            source.schedule(deadline: .now() + resolvedTimeout)
+            source.setEventHandler { [weak self] in
+                self?.handleRequestTimeout(currentId)
             }
+
+            source.resume()
+            let timer: DispatchSourceTimer? = source
             
             let request = RPCRequest(
                 method: method,
@@ -836,7 +848,8 @@ public final class ElectrumClient {
             content: out,
             completion: .contentProcessed({ [weak self] error in
                 if let error = error {
-                    self?.log("Send error: \(error)")
+                    self?.log("Send error: \(error); bouncing")
+                    self?.bounce()
                 }
             })
         )
@@ -927,10 +940,13 @@ public final class ElectrumClient {
         else { return }
         
         status = .connecting
-        
+
         reconnectTask?.cancel()
         reconnectTask = nil
-        
+
+        // Detach the handler so the superseded connection's late .cancelled
+        // can't clobber this attempt's state or fail its queued requests
+        connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil
         
@@ -1005,19 +1021,52 @@ public final class ElectrumClient {
 
         status = .stopped
         reconnectAttempts = 0
-        
-        // Fail all outstanding requests
+        pingFailures = 0
+
+        failPendingRequests(.connectionClosed)
+        subscriptions.removeAll()
+
+        log("Connection closed")
+    }
+
+    /// Fails all outstanding requests with the given error
+    ///
+    /// - Parameter error: The error delivered to every pending completion handler
+    ///
+    /// Guarantees no caller is left awaiting a completion that will never arrive.
+    private func failPendingRequests(_ error: ElectrumError) {
         for (_, request) in requests {
             request.timer?.cancel()
             config.callbackQueue.async {
-                request.completion(.failure(.connectionClosed))
+                request.completion(.failure(error))
             }
         }
-        
+
         requests.removeAll()
-        subscriptions.removeAll()
-        
-        log("Connection closed")
+    }
+
+    /// Tears down a connection believed dead and schedules a reconnection
+    ///
+    /// All outstanding requests are failed with ``ElectrumError/connectionClosed``.
+    /// Subscriptions are preserved and re-established on reconnect. No-op after ``stop()``.
+    private func bounce() {
+        guard status != .stopped else { return }
+
+        // Detach the handler so the late .cancelled event can't race the state below
+        connection?.stateUpdateHandler = nil
+        connection?.cancel()
+        connection = nil
+
+        pingTask?.cancel()
+        pingTask = nil
+        pingFailures = 0
+
+        failPendingRequests(.connectionClosed)
+
+        status = .disconnected
+        scheduleReconnect()
+
+        log("Connection bounced")
     }
     
     /// Begins the receive loop to continuously read data from the server
@@ -1037,8 +1086,12 @@ public final class ElectrumClient {
                 if let data = data, !data.isEmpty {
                     self.handleReceivedData(data)
                 }
-                
-                if !isComplete {
+
+                if isComplete {
+                    // Server closed its write side; the connection is unusable
+                    self.log("Receive stream completed; bouncing")
+                    self.bounce()
+                } else {
                     self.startReceiving()
                 }
             }
@@ -1049,17 +1102,33 @@ public final class ElectrumClient {
     ///
     /// This function creates a timer that periodically sends keepalive messages
     /// to prevent idle connection timeouts.
+    ///
+    /// Pings double as dead-connection detection: a connection that silently
+    /// black-holes (no state transition) fails two consecutive pings and is bounced.
     private func startPinging() {
         pingTask?.cancel()
-        
+
         let task = DispatchSource.makeTimerSource(queue: network)
         task.schedule(deadline: .now(), repeating: config.pingInterval)
         task.setEventHandler { [weak self] in
-            // Ignore ping response, it's just NULL anyway
-            self?.request(method: "server.ping") { _ in }
+            self?.request(method: "server.ping", timeout: 10.0) { [weak self] result in
+                guard let self = self else { return }
+                self.network.async {
+                    switch result {
+                    case .success:
+                        self.pingFailures = 0
+                    case .failure:
+                        self.pingFailures += 1
+                        if self.pingFailures >= 2 {
+                            self.log("Keepalive failed twice; bouncing")
+                            self.bounce()
+                        }
+                    }
+                }
+            }
         }
         task.resume()
-        
+
         pingTask = task
     }
     
@@ -1130,6 +1199,7 @@ public final class ElectrumClient {
         case .ready:
             status = .connected
             reconnectAttempts = 0
+            pingFailures = 0
 
             startReceiving()
             startPinging()
@@ -1139,20 +1209,27 @@ public final class ElectrumClient {
 
         case .failed(let error):
             status = .disconnected
-            
+
             pingTask?.cancel()
             pingTask = nil
-            
+
+            failPendingRequests(.connectionClosed)
             scheduleReconnect()
-            
+
             log("Connection broken: \(error)")
-            
+
         case .cancelled:
-            status = .disconnected
-            
+            // stop() owns its own teardown; a late .cancelled must not
+            // revive a stopped client into the auto-reconnect path
+            if status != .stopped {
+                status = .disconnected
+            }
+
             pingTask?.cancel()
             pingTask = nil
-            
+
+            failPendingRequests(.connectionClosed)
+
             log("Connection terminated")
             
         default:
