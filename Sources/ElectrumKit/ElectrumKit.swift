@@ -29,6 +29,12 @@ fileprivate let terminators: Set<Data> = [
     Data([0x5D, 0x0A])
 ]
 
+/// Hard cap on the unparsed receive buffer. A well-behaved Electrum server delimits
+/// every message with a newline; if this much data accumulates without one, the peer is
+/// misbehaving and the connection is bounced rather than risking unbounded memory growth.
+/// 32 MiB comfortably exceeds any single legitimate Electrum response.
+fileprivate let maxBufferedMessageBytes: Int = 32 * 1024 * 1024
+
 // MARK: - ElectrumError
 
 /// Errors thrown by the Electrum client
@@ -373,7 +379,11 @@ struct RPCError: Decodable {
 ///
 /// All public functions are thread-safe and can be called from any queue. Internal
 /// synchronization is handled automatically.
-public final class ElectrumClient {
+/// `@unchecked Sendable`: all mutable state is serialized on the private `network`
+/// queue (with `receiveBuffer` confined to the `read` queue and the TLS verify path to
+/// the `verify` queue), so the type is safe to share across concurrency domains even
+/// though the compiler can't prove it.
+public final class ElectrumClient: @unchecked Sendable {
     
     // MARK: - Properties
     
@@ -414,6 +424,11 @@ public final class ElectrumClient {
     
     /// Active subscriptions, keyed by a hash of the method and parameters
     private var subscriptions: [String: NetworkSubscription] = [:]
+
+    /// Method-routed subscriptions, keyed by method name. Used for protocol extensions
+    /// (e.g. Frigate silent payments) whose notifications carry by-name OBJECT params and
+    /// therefore do not echo the subscribe request's positional params.
+    private var methodSubscriptions: [String: MethodSubscription] = [:]
     
     /// Keychain query parameters for pinned certificates
     private let pinnedKeychainQuery: [String: Any]
@@ -447,9 +462,15 @@ public final class ElectrumClient {
 
     /// Queue for network operations and state management
     private let network: DispatchQueue
-    
+
     /// Queue for processing received data
     private let read: DispatchQueue
+
+    /// Queue for the TLS verify block (keychain + SecTrust I/O). Kept off `network` so a
+    /// slow keychain or SecTrust evaluation during the handshake can't stall connection
+    /// state, the receive loop, or keepalives. The verify path touches only immutable
+    /// state (host + keychain queries), so a separate queue is race-free.
+    private let verify: DispatchQueue
 
     // MARK: - Internal helper types
     
@@ -474,12 +495,25 @@ public final class ElectrumClient {
 
         /// The subscription method name
         let method: String
-        
+
         /// The parameters for the subscription
         let params: [Any]
-        
+
         /// The handler invoked when notifications are received
         let handler: ([Any]) -> Void
+    }
+
+    /// Context for a method-routed subscription (notifications routed by method name).
+    private struct MethodSubscription {
+
+        /// The subscription method name (also the notification method).
+        let method: String
+
+        /// The params sent in the subscribe request, re-sent on reconnect.
+        let params: [Any]
+
+        /// The handler invoked with each notification's raw params (object or array).
+        let handler: (Any) -> Void
     }
     
     /// Context for an outstanding request
@@ -509,6 +543,7 @@ public final class ElectrumClient {
         
         network = DispatchQueue(label: "\(host).network")
         read = DispatchQueue(label: "\(host).read")
+        verify = DispatchQueue(label: "\(host).verify")
         
         // Base queries used for saving certificates + markers to the keychain
         caKeychainQuery = [
@@ -531,7 +566,27 @@ public final class ElectrumClient {
     }
     
     // MARK: - Public API
-    
+
+    /// The connection state of the client, exposed for UI/status purposes.
+    public enum ConnectionState: Sendable {
+        case stopped, disconnected, connecting, connected
+    }
+
+    /// A thread-safe snapshot of the current connection state.
+    ///
+    /// Safe to call from any queue except the configured `callbackQueue` while it is the
+    /// same queue used internally (the default `.main` callbackQueue is always safe).
+    public var connectionState: ConnectionState {
+        network.sync {
+            switch status {
+            case .stopped: return .stopped
+            case .disconnected: return .disconnected
+            case .connecting: return .connecting
+            case .connected: return .connected
+            }
+        }
+    }
+
     /// Starts the client and initiates a connection to the server
     ///
     /// This function is asynchronous and returns immediately. Connection state changes
@@ -687,6 +742,57 @@ public final class ElectrumClient {
         }
     }
     
+    /// Subscribes to a server notification stream routed by method name.
+    ///
+    /// - Parameters:
+    ///   - method: The subscription/notification method name.
+    ///   - params: Parameters for the subscribe request. Re-sent on every reconnection.
+    ///   - handler: Invoked with each notification's raw params (a by-name object or an
+    ///              array, depending on the server).
+    ///
+    /// Unlike ``subscribe(method:params:handler:)``, this routes notifications by method
+    /// name alone, so it works with protocol extensions (e.g. Frigate silent payments)
+    /// whose notifications do NOT echo the subscribe request's params. The subscribe
+    /// request is sent now and re-sent on reconnect; persists until ``unsubscribe(fromMethod:)``.
+    public func subscribe(
+        toMethod method: String,
+        params: [Any] = [],
+        handler: @escaping (Any) -> Void
+    ) {
+        network.async { [weak self] in
+            guard let self = self else { return }
+
+            // Keyed in without an active connection; re-established on reconnect.
+            self.methodSubscriptions[method] = MethodSubscription(
+                method: method,
+                params: params,
+                handler: handler
+            )
+
+            guard self.connection != nil, self.status == .connected else { return }
+
+            self.request(method: method, params: params) { [weak self] result in
+                guard let self = self else { return }
+                switch result {
+                case .success:
+                    self.log("Subscribed (by method) to \"\(method)\"")
+                case .failure(let error):
+                    self.log("Subscription (by method) to \"\(method)\" failed: \(error)")
+                }
+            }
+        }
+    }
+
+    /// Removes a previously-registered method-routed subscription.
+    ///
+    /// - Parameter method: The method name originally passed to ``subscribe(toMethod:params:handler:)``.
+    public func unsubscribe(fromMethod method: String) {
+        log("Unsubscribed (by method) from \"\(method)\"")
+        network.async { [weak self] in
+            self?.methodSubscriptions.removeValue(forKey: method)
+        }
+    }
+
     /// Removes a previously-registered subscription.
     ///
     /// - Parameters:
@@ -958,8 +1064,8 @@ public final class ElectrumClient {
             config.tlsMinVersion
         )
         
-        // Custom verification block for CA & self
-        // signed certs, runs on the verify queue
+        // Custom verification block for CA & self-signed certs. Runs on the dedicated
+        // `verify` queue so its keychain + SecTrust I/O never blocks the network queue.
         sec_protocol_options_set_verify_block(
             secOptions,
             { [weak self] metadata, trust, callback in
@@ -973,7 +1079,7 @@ public final class ElectrumClient {
                     callback: callback
                 )
             },
-            network
+            verify
         )
         
         let parameters = NWParameters(tls: options)
@@ -988,15 +1094,20 @@ public final class ElectrumClient {
         }
         newConnection.start(queue: network)
         connection = newConnection
-        
+
+        // Cancel the previous monitor before replacing it. A leaked monitor keeps firing
+        // pathUpdateHandler and races the live connection's reconnect bookkeeping.
+        monitor?.pathUpdateHandler = nil
+        monitor?.cancel()
+
         let newMonitor = NWPathMonitor()
         newMonitor.pathUpdateHandler = { [weak self] path in
             self?.handlePathUpdate(path)
         }
-        
+
         newMonitor.start(queue: network)
         monitor = newMonitor
-        
+
         log("Connection initiating")
     }
     
@@ -1025,6 +1136,8 @@ public final class ElectrumClient {
 
         failPendingRequests(.connectionClosed)
         subscriptions.removeAll()
+        methodSubscriptions.removeAll()
+        sendBuffer.removeAll()
 
         log("Connection closed")
     }
@@ -1144,14 +1257,29 @@ public final class ElectrumClient {
                 params: subscription.params
             ) { [weak self] result in
                 guard let self = self else { return }
-                
+
                 switch result {
                 case .success(let data):
                     subscription.handler(subscription.params + [data])
                     self.log("Resubscribed to { \"\(subscription.method)\", \(subscription.params) }")
                 case .failure(let error):
                     self.log("Resubscription to { \"\(subscription.method)\", \(subscription.params) } failed: \(error)")
-                    break
+                }
+            }
+        }
+
+        for methodSubscription in methodSubscriptions.values {
+            request(
+                method: methodSubscription.method,
+                params: methodSubscription.params
+            ) { [weak self] result in
+                guard let self = self else { return }
+
+                switch result {
+                case .success:
+                    self.log("Resubscribed (by method) to \"\(methodSubscription.method)\"")
+                case .failure(let error):
+                    self.log("Resubscription (by method) to \"\(methodSubscription.method)\" failed: \(error)")
                 }
             }
         }
@@ -1247,11 +1375,24 @@ public final class ElectrumClient {
         if path.status == .unsatisfied {
             log("Network path broken")
 
+            // Detach so the resulting .cancelled can't double-process or revive state.
+            connection?.stateUpdateHandler = nil
             connection?.cancel()
             connection = nil
-            
+
+            pingTask?.cancel()
+            pingTask = nil
+            pingFailures = 0
+
             reconnectTask?.cancel()
             reconnectTask = nil
+
+            // Force a clean disconnected state so path restoration reliably reconnects,
+            // even if the drop landed mid-.connecting (where status would otherwise stick).
+            if status != .stopped {
+                status = .disconnected
+            }
+            failPendingRequests(.connectionClosed)
         } else if path.status == .satisfied, status == .disconnected {
             log("Network path established")
             connect()
@@ -1280,17 +1421,26 @@ public final class ElectrumClient {
     private func handleReceivedData(_ data: Data) {
         read.async { [weak self] in
             guard let self = self else { return }
-            
+
             self.receiveBuffer.append(data)
-            
+
             // Extract newline-delimited messages
             while let range = self.receiveBuffer.range(of: Data([newline])) {
                 let data = self.receiveBuffer.subdata(in: 0..<range.lowerBound)
                 self.receiveBuffer.removeSubrange(0...range.lowerBound)
-                
+
                 if !data.isEmpty {
                     self.processMessage(data)
                 }
+            }
+
+            // Guard against unbounded growth: a server (malicious or buggy) that streams
+            // data without a newline delimiter would otherwise grow this buffer until the
+            // process is OOM-killed. Cap it and bounce the connection instead.
+            if self.receiveBuffer.count > maxBufferedMessageBytes {
+                self.log("Receive buffer exceeded \(maxBufferedMessageBytes) bytes without a delimiter; bouncing")
+                self.receiveBuffer.removeAll()
+                self.network.async { [weak self] in self?.bounce() }
             }
         }
     }
@@ -1358,23 +1508,32 @@ public final class ElectrumClient {
     ///
     /// - Note: Notifications with invalid parameters or no matching subscription are ignored.
     private func handleNotification(_ notification: RPCNotification) {
-        guard let data = notification.params.value as? [Any], !data.isEmpty else {
-            log("Invalid notification: \(notification)")
-            return
-        }
-        
-        let params = Array(data.dropLast())
-        let key = key(method: notification.method, params: params)
-        
+        let method = notification.method
+        let raw = notification.params.value
+
         network.async { [weak self] in
-            guard
-                let self = self,
-                let subscription = self.subscriptions[key]
-            else {
+            guard let self = self else { return }
+
+            // Method-routed (e.g. Frigate silent payments): notifications carry by-name
+            // object params that don't echo the subscribe request. Deliver the raw params.
+            if let methodSubscription = self.methodSubscriptions[method] {
+                self.config.callbackQueue.async {
+                    methodSubscription.handler(raw)
+                }
                 return
             }
-            
-            config.callbackQueue.async {
+
+            // Positional (scripthash/headers): the notification echoes the subscribe
+            // params as a leading array, with the new data appended last.
+            guard let data = raw as? [Any], !data.isEmpty else {
+                self.log("Invalid notification: \(notification)")
+                return
+            }
+
+            let key = self.key(method: method, params: Array(data.dropLast()))
+            guard let subscription = self.subscriptions[key] else { return }
+
+            self.config.callbackQueue.async {
                 subscription.handler(data)
             }
         }
@@ -1405,9 +1564,17 @@ public final class ElectrumClient {
     ) {
         // Convert sec_trust_t to a SecTrust reference for higher-level APIs
         let ref = sec_trust_copy_ref(trust).takeRetainedValue()
+
+        // Enforce hostname matching for CA-based trust. Without an SSL policy bound to
+        // `host`, SecTrustEvaluateWithError validates only the CA chain, so a CA-signed
+        // certificate issued for ANY hostname would be accepted (and, once a CA trust
+        // marker is saved, accepted on every later connection), a MITM vector. The
+        // self-signed path below resets policies in validateCertificate(), where the
+        // exact-byte pin is the identity and hostname is intentionally not required.
+        SecTrustSetPolicies(ref, SecPolicyCreateSSL(true, host as CFString))
         let trusted = SecTrustEvaluateWithError(ref, nil)
-        
-        log("Trusted by system CA: \(trusted)")
+
+        log("Trusted by system CA + hostname: \(trusted)")
         
         // Subsequent connection, we check if
         // host has been marked as CA trusted

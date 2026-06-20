@@ -55,6 +55,49 @@ client.subscribe(
 }
 ```
 
+### Method-routed subscriptions (protocol extensions)
+
+Standard Electrum notifications echo the subscription's request parameters, so they can
+be matched by `method + params`. Some protocol extensions - notably
+[Frigate](https://github.com/sparrowwallet/frigate) silent payments - instead deliver
+by-name **object** params (`{"subscription": …, "progress": …, "history": […]}`) that do
+not echo the request. Route those by method name with `subscribe(toMethod:)`, whose
+handler receives the raw notification params:
+
+```swift
+client.subscribe(
+    toMethod: "blockchain.silentpayments.subscribe",
+    params: [scanPrivKeyHex, spendPubKeyHex, startHeight]
+) { params in
+    guard let body = params as? [String: Any],
+          let history = body["history"] as? [[String: Any]] else { return }
+    // each entry: { "height": Int, "tx_hash": String, "tweak_key": String }
+}
+```
+
+> Numeric JSON fields decode as `Int` when integral (e.g. `progress: 1.0` → `Int 1`) and
+> `Double` otherwise; read them via `NSNumber` (`(value as? NSNumber)?.doubleValue`).
+
+### Connection state
+
+```swift
+switch client.connectionState {
+case .connected:   …
+case .connecting:  …
+case .disconnected, .stopped: …
+}
+```
+
+## Testing
+
+```sh
+swift test
+```
+
+Unit tests cover the JSON-RPC codec (including positional vs. by-name notifications),
+configuration, and error handling. Connection, TLS pinning, and live notification routing
+are validated against a real Electrum / Frigate endpoint as integration tests.
+
 ## Contributing
 
 Contributions are welcome. Please submit pull requests or open issues for bugs and feature requests.
