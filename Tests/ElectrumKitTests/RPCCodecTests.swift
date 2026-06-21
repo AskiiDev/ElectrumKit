@@ -66,4 +66,27 @@ final class RPCCodecTests: XCTestCase {
         XCTAssertEqual(first["tweak_key"] as? String, "0314bec1")
         XCTAssertEqual((history[1] as? [String: Any])?["height"] as? Int, 0) // mempool
     }
+
+    // Frigate attaches a NON-STANDARD `id` to its silent-payments notifications. Keying
+    // off id-presence (the original bug) mis-routes them into the request/response path,
+    // where they are dropped as a response to an unknown id. processMessage must route by
+    // `method` first, so the method-routed handler still receives them.
+    func testIdBearingNotificationRoutesToMethodHandlerNotResponse() {
+        let client = ElectrumClient(host: "example.invalid", port: 50002)
+        let received = XCTestExpectation(description: "method handler receives the id-bearing notification")
+        var deliveredHistory: Int?
+        client.subscribe(toMethod: "blockchain.silentpayments.subscribe") { raw in
+            deliveredHistory = ((raw as? [String: Any])?["history"] as? [Any])?.count
+            received.fulfill()
+        }
+        // The exact live Frigate shape: a by-name object params AND a trailing `id`.
+        let json = """
+        {"jsonrpc":"2.0","method":"blockchain.silentpayments.subscribe","params":{\
+        "subscription":{"address":"sp1qtest","labels":[0],"start_height":0},"progress":1.0,\
+        "history":[{"height":0,"tx_hash":"9cdd","tweak_key":"03605de1"}]},"id":2}
+        """
+        client.processMessage(Data(json.utf8))
+        wait(for: [received], timeout: 2.0)
+        XCTAssertEqual(deliveredHistory, 1)
+    }
 }

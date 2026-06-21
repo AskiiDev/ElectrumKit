@@ -1474,20 +1474,26 @@ public final class ElectrumClient: @unchecked Sendable {
     /// messages) or an `RPCNotification` (for server-initiated notifications). If the message
     /// is a response with a valid ID, it is passed to `handleResponse()`. If it is a notification,
     /// it is passed to `handleNotification()`.
-    private func processMessage(_ data: Data) {
+    // internal (not private) so the notification/response routing is unit-testable.
+    func processMessage(_ data: Data) {
+        // A server notification is identified by its `method`; a request/response is not.
+        // Some servers (notably Frigate's silent-payments stream) attach a non-standard
+        // `id` to notifications, so keying off id-presence would mis-route them into the
+        // response path and silently drop them. Decode as a notification (method-bearing)
+        // FIRST. A genuine response has no `method`, so it falls through to the id path.
         if
+            let notification = try? JSONDecoder().decode(RPCNotification.self, from: data)
+        {
+            handleNotification(notification)
+            return
+        } else if
             let response = try? JSONDecoder().decode(RPCResponse.self, from: data),
             let id = response.id
         {
             handleResponse(id: id, response: response)
             return
-        } else if
-            let notification = try? JSONDecoder().decode(RPCNotification.self, from: data)
-        {
-            handleNotification(notification)
-            return
         }
-        
+
         log("Failed to decode message: \(String(data: data, encoding: .utf8) ?? "invalid")")
     }
     
