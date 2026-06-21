@@ -1319,6 +1319,11 @@ public final class ElectrumClient: @unchecked Sendable {
         )
     }
     
+    /// `server.version` handshake identity. `protocolVersion` is the
+    /// Electrum protocol version we advertise; "1.4" is the broadly-supported baseline
+    private static let clientName = "ElectrumKit"
+    private static let protocolVersion = "1.4"
+
     /// Handles updates to the connection state
     ///
     /// - Parameter state: The new connection state
@@ -1330,9 +1335,25 @@ public final class ElectrumClient: @unchecked Sendable {
             pingFailures = 0
 
             startReceiving()
-            startPinging()
-            resubscribeAll()
-            
+
+            request(
+                method: "server.version",
+                params: [
+                    Self.clientName,
+                    Self.protocolVersion
+                ],
+                timeout: 10.0
+            ) { [weak self] result in
+                guard let self = self else { return }
+                self.network.async {
+                    if case .failure(let error) = result {
+                        self.log("server.version handshake failed (continuing): \(error)")
+                    }
+                    self.startPinging()
+                    self.resubscribeAll()
+                }
+            }
+
             log("Connection ready")
 
         case .failed(let error):
