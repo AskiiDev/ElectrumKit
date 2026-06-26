@@ -421,7 +421,10 @@ public final class ElectrumClient: @unchecked Sendable {
     
     /// Outstanding requests awaiting responses, keyed by request ID
     private var requests: [Int: NetworkRequest] = [:]
-    
+
+    /// Requests deferred because the in-flight limit was reached, sent FIFO as slots free
+    private var queuedRequests: [QueuedRequest] = []
+
     /// Active subscriptions, keyed by a hash of the method and parameters
     private var subscriptions: [String: NetworkSubscription] = [:]
 
@@ -518,12 +521,28 @@ public final class ElectrumClient: @unchecked Sendable {
     
     /// Context for an outstanding request
     private struct NetworkRequest {
-        
+
         /// The completion handler to invoke with the result
         let completion: (Result<Any, ElectrumError>) -> Void
-        
+
         /// An optional timer that triggers timeout handling
         let timer: DispatchSourceTimer?
+    }
+
+    /// Context for a request deferred until an in-flight slot frees
+    private struct QueuedRequest {
+
+        /// The remote method name to invoke
+        let method: String
+
+        /// The parameters to pass to the method
+        let params: [Any]
+
+        /// An optional timeout interval, applied when the request is sent
+        let timeout: TimeInterval?
+
+        /// The completion handler to invoke with the result
+        let completion: (Result<Any, ElectrumError>) -> Void
     }
     
     /// Creates a new Electrum client
@@ -638,58 +657,96 @@ public final class ElectrumClient: @unchecked Sendable {
                 return
             }
             
-            // Enforce request concurrency limit
+            // Defer when the in-flight limit is reached; drained as responses free slots
             guard self.requests.count < config.requestLimit else {
-                self.log("Request \"\(method)\" failed: request limit reached")
-                self.config.callbackQueue.async {
-                    completion(.failure(.requestLimit))
-                }
+                self.queuedRequests.append(QueuedRequest(
+                    method: method,
+                    params: params,
+                    timeout: timeout,
+                    completion: completion
+                ))
                 return
-            }
-            
-            let currentId = self.requestId
-            self.requestId += 1
-        
-            // Start the countdown for the request timeout
-            let resolvedTimeout = timeout ?? config.requestTimeout
-            let source = DispatchSource.makeTimerSource(queue: self.network)
-            source.schedule(deadline: .now() + resolvedTimeout)
-            source.setEventHandler { [weak self] in
-                self?.handleRequestTimeout(currentId)
             }
 
-            source.resume()
-            let timer: DispatchSourceTimer? = source
-            
-            let request = RPCRequest(
+            self.dispatchRequest(
                 method: method,
                 params: params,
-                id: currentId
+                timeout: timeout,
+                completion: completion
             )
-            
-            self.log("Requesting { \"\(method)\", \(params) }")
-            
-            // Encode JSON payload
-            let data = try? JSONEncoder().encode(request)
-            guard var data = data, !data.isEmpty else {
-                self.log("Failed to encode { \"\(method)\", \(params) }")
-                self.config.callbackQueue.async {
-                    completion(.failure(.requestNoncodable))
-                }
-                return
+        }
+    }
+
+    /// Assigns an identifier, starts the timeout, encodes, and enqueues a request for sending
+    ///
+    /// Must be called on `network` with an in-flight slot available and the connection open.
+    private func dispatchRequest(
+        method: String,
+        params: [Any],
+        timeout: TimeInterval?,
+        completion: @escaping (Result<Any, ElectrumError>) -> Void
+    ) {
+        let currentId = self.requestId
+        self.requestId += 1
+
+        // Start the countdown for the request timeout
+        let resolvedTimeout = timeout ?? config.requestTimeout
+        let source = DispatchSource.makeTimerSource(queue: self.network)
+        source.schedule(deadline: .now() + resolvedTimeout)
+        source.setEventHandler { [weak self] in
+            self?.handleRequestTimeout(currentId)
+        }
+
+        source.resume()
+        let timer: DispatchSourceTimer? = source
+
+        let request = RPCRequest(
+            method: method,
+            params: params,
+            id: currentId
+        )
+
+        self.log("Requesting { \"\(method)\", \(params) }")
+
+        // Encode JSON payload
+        let data = try? JSONEncoder().encode(request)
+        guard var data = data, !data.isEmpty else {
+            self.log("Failed to encode { \"\(method)\", \(params) }")
+            source.cancel()
+            self.config.callbackQueue.async {
+                completion(.failure(.requestNoncodable))
             }
-            
-            // Store the request context so responses
-            // and their timeouts can be correlated
-            self.requests[currentId] = NetworkRequest(
-                completion: completion,
-                timer: timer
+            return
+        }
+
+        // Store the request context so responses
+        // and their timeouts can be correlated
+        self.requests[currentId] = NetworkRequest(
+            completion: completion,
+            timer: timer
+        )
+
+        // Each RPC call MUST be terminated by
+        // a single newline to delimit messages
+        data.append(newline)
+        self.enqueuePacket(data)
+    }
+
+    /// Sends queued requests until the in-flight limit is reached
+    ///
+    /// Called whenever a slot frees so deferred requests make progress instead of
+    /// being rejected. No-op unless connected.
+    private func drainQueuedRequests() {
+        guard connection != nil, status == .connected else { return }
+
+        while self.requests.count < config.requestLimit, !self.queuedRequests.isEmpty {
+            let queued = self.queuedRequests.removeFirst()
+            self.dispatchRequest(
+                method: queued.method,
+                params: queued.params,
+                timeout: queued.timeout,
+                completion: queued.completion
             )
-            
-            // Each RPC call MUST be terminated by
-            // a single newline to delimit messages
-            data.append(newline)
-            self.enqueuePacket(data)
         }
     }
     
@@ -1142,7 +1199,7 @@ public final class ElectrumClient: @unchecked Sendable {
         log("Connection closed")
     }
 
-    /// Fails all outstanding requests with the given error
+    /// Fails all outstanding and queued requests with the given error
     ///
     /// - Parameter error: The error delivered to every pending completion handler
     ///
@@ -1156,6 +1213,14 @@ public final class ElectrumClient: @unchecked Sendable {
         }
 
         requests.removeAll()
+
+        for queued in queuedRequests {
+            config.callbackQueue.async {
+                queued.completion(.failure(error))
+            }
+        }
+
+        queuedRequests.removeAll()
     }
 
     /// Tears down a connection believed dead and schedules a reconnection
@@ -1431,6 +1496,8 @@ public final class ElectrumClient: @unchecked Sendable {
         self.config.callbackQueue.async {
             request.completion(.failure(.requestTimeout))
         }
+
+        self.drainQueuedRequests()
     }
     
     /// Appends newly-received data to the receive buffer and processes complete messages
@@ -1514,7 +1581,7 @@ public final class ElectrumClient: @unchecked Sendable {
             }
             
             request.timer?.cancel()
-            
+
             config.callbackQueue.async {
                 if let error = response.error {
                     request.completion(.failure(.responseError(
@@ -1526,6 +1593,8 @@ public final class ElectrumClient: @unchecked Sendable {
                     request.completion(.success(value))
                 }
             }
+
+            self.drainQueuedRequests()
         }
     }
     
