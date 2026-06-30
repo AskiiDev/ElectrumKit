@@ -459,7 +459,18 @@ public final class ElectrumClient: @unchecked Sendable {
     
     /// A scheduled task to attempt reconnection
     private var reconnectTask: DispatchWorkItem? = nil
-    
+
+    /// A debounced reconnect scheduled from a network-path `.satisfied` event. A foreground transition (or a
+    /// radio/path migration, e.g. the cellular `pdp_ip0` settling) can FLAP the path through
+    /// `.satisfied`/`.unsatisfied` several times in quick succession; without coalescing, every `.satisfied`
+    /// flip calls `connect()` -> a fresh connection -> `resubscribeAll()` over EVERY subscription, so N flaps
+    /// replay all subscriptions N times (the foreground resubscribe storm). Debouncing collapses the flaps
+    /// into ONE reconnect.
+    private var pathReconnectTask: DispatchWorkItem? = nil
+
+    /// How long a `.satisfied` path must stay settled before the debounced reconnect fires.
+    private let pathReconnectDebounce: TimeInterval = 0.5
+
     /// A scheduled timer for sending periodic ping messages
     private var pingTask: DispatchSourceTimer? = nil
 
@@ -1183,9 +1194,12 @@ public final class ElectrumClient: @unchecked Sendable {
         
         pingTask?.cancel()
         pingTask = nil
-        
+
         reconnectTask?.cancel()
         reconnectTask = nil
+
+        pathReconnectTask?.cancel()
+        pathReconnectTask = nil
 
         status = .stopped
         reconnectAttempts = 0
@@ -1473,6 +1487,11 @@ public final class ElectrumClient: @unchecked Sendable {
             reconnectTask?.cancel()
             reconnectTask = nil
 
+            // The path broke again before the debounced reconnect fired: drop it (the next `.satisfied`
+            // re-arms), so a flap can't leave a reconnect scheduled against a dead path.
+            pathReconnectTask?.cancel()
+            pathReconnectTask = nil
+
             // Force a clean disconnected state so path restoration reliably reconnects,
             // even if the drop landed mid-.connecting (where status would otherwise stick).
             if status != .stopped {
@@ -1481,7 +1500,17 @@ public final class ElectrumClient: @unchecked Sendable {
             failPendingRequests(.connectionClosed)
         } else if path.status == .satisfied, status == .disconnected {
             log("Network path established")
-            connect()
+            // Debounced: coalesce a flapping foreground/path-migration transition into ONE reconnect so we
+            // don't replay every subscription per flap. Each `.satisfied` reschedules; the final settled one
+            // fires connect() once.
+            pathReconnectTask?.cancel()
+            let task = DispatchWorkItem { [weak self] in
+                guard let self = self else { return }
+                self.pathReconnectTask = nil
+                if self.status == .disconnected { self.connect() }
+            }
+            pathReconnectTask = task
+            network.asyncAfter(deadline: .now() + pathReconnectDebounce, execute: task)
         }
     }
     
